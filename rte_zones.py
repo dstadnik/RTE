@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+RTE Zones - Система проверки геозон доставки ресторанов
+Позволяет проверить попадание геоточки в зоны доставки и добавить информацию о городах
+"""
+
 import pandas as pd
 import geopandas as gpd
 from shapely.wkt import loads
@@ -7,7 +13,9 @@ import time
 from typing import Tuple, Optional, List
 import json
 
-class GeoZoneChecker:
+class RTEZoneChecker:
+    """Класс для работы с геозонами доставки ресторанов"""
+    
     def __init__(self, polygons_file: str):
         """
         Инициализация класса для работы с геозонами
@@ -96,6 +104,55 @@ class GeoZoneChecker:
         
         return results
     
+    def is_point_in_any_zone(self, lat: float, lon: float) -> bool:
+        """
+        Простая проверка - попадает ли точка в любую геозону
+        
+        Args:
+            lat: широта точки
+            lon: долгота точки
+            
+        Returns:
+            True если точка попадает хотя бы в одну геозону, False иначе
+        """
+        results = self.point_in_zones(lat, lon)
+        return len(results) > 0
+    
+    def get_restaurants_for_point(self, lat: float, lon: float) -> List[dict]:
+        """
+        Получает список ресторанов, которые доставляют в указанную точку
+        
+        Args:
+            lat: широта точки
+            lon: долгота точки
+            
+        Returns:
+            Список уникальных ресторанов с их зонами доставки
+        """
+        zones = self.point_in_zones(lat, lon)
+        
+        # Группируем по ресторанам
+        restaurants = {}
+        for zone in zones:
+            restaurant_id = zone.get('ID реста', 'unknown')
+            partner = zone.get('Партнер', 'Неизвестно')
+            zone_name = zone.get('name', 'Неизвестная зона')
+            
+            if restaurant_id not in restaurants:
+                restaurants[restaurant_id] = {
+                    'restaurant_id': restaurant_id,
+                    'partner': partner,
+                    'zones': []
+                }
+            
+            restaurants[restaurant_id]['zones'].append({
+                'name': zone_name,
+                'internal_id': zone.get('ID внутренний', ''),
+                'index': zone['index']
+            })
+        
+        return list(restaurants.values())
+    
     def get_city_from_coordinates(self, lat: float, lon: float, delay: float = 1.0) -> Optional[str]:
         """
         Получает название города по координатам через Nominatim API
@@ -119,7 +176,7 @@ class GeoZoneChecker:
                 'addressdetails': 1
             }
             headers = {
-                'User-Agent': 'GeoZoneChecker/1.0'
+                'User-Agent': 'RTEZoneChecker/1.0'
             }
             
             response = requests.get(url, params=params, headers=headers, timeout=10)
@@ -232,49 +289,140 @@ class GeoZoneChecker:
         
         print(f"Данные сохранены в {filename}")
     
-    def check_point_example(self, lat: float, lon: float):
+    def get_stats(self) -> dict:
         """
-        Пример проверки точки
+        Получает статистику по геозонам
         
-        Args:
-            lat: широта
-            lon: долгота
+        Returns:
+            Словарь со статистикой
         """
-        print(f"\nПроверяем точку: {lat}, {lon}")
+        if self.gdf is None:
+            return {}
         
-        results = self.point_in_zones(lat, lon)
+        stats = {
+            'total_zones': len(self.gdf),
+            'partners': self.gdf['Партнер'].nunique() if 'Партнер' in self.gdf.columns else 0,
+            'restaurants': self.gdf['ID реста'].nunique() if 'ID реста' in self.gdf.columns else 0,
+        }
         
-        if results:
-            print(f"Точка попадает в {len(results)} геозон(ы):")
-            for i, result in enumerate(results, 1):
-                print(f"  {i}. Индекс в файле: {result['index']}")
-                # Выводим дополнительную информацию если есть
-                for key, value in result.items():
-                    if key not in ['index', 'geometry', 'WKT']:
-                        print(f"     {key}: {value}")
-        else:
-            print("Точка не попадает ни в одну геозону")
+        if 'Партнер' in self.gdf.columns:
+            stats['partner_distribution'] = self.gdf['Партнер'].value_counts().to_dict()
+        
+        if 'city' in self.gdf.columns:
+            stats['cities'] = self.gdf['city'].nunique()
+            stats['city_distribution'] = self.gdf['city'].value_counts().head(10).to_dict()
+        
+        return stats
+    
+    def print_stats(self):
+        """Выводит статистику в консоль"""
+        stats = self.get_stats()
+        
+        print("\n=== Статистика геозон ===")
+        print(f"Всего геозон: {stats.get('total_zones', 0)}")
+        print(f"Партнеров: {stats.get('partners', 0)}")
+        print(f"Ресторанов: {stats.get('restaurants', 0)}")
+        
+        if 'partner_distribution' in stats:
+            print("\nРаспределение по партнерам:")
+            for partner, count in stats['partner_distribution'].items():
+                print(f"  {partner}: {count}")
+        
+        if 'city_distribution' in stats:
+            print(f"\nГородов: {stats.get('cities', 0)}")
+            print("Топ-10 городов по количеству геозон:")
+            for city, count in stats['city_distribution'].items():
+                print(f"  {city}: {count}")
+
+
+def check_point_simple(lat: float, lon: float, polygons_file: str = 'polygons.xlsx') -> bool:
+    """
+    Простая функция для быстрой проверки точки
+    
+    Args:
+        lat: широта
+        lon: долгота
+        polygons_file: путь к файлу с полигонами
+        
+    Returns:
+        True если точка в зоне доставки, False иначе
+    """
+    checker = RTEZoneChecker(polygons_file)
+    return checker.is_point_in_any_zone(lat, lon)
+
+
+def get_delivery_restaurants(lat: float, lon: float, polygons_file: str = 'polygons.xlsx') -> List[dict]:
+    """
+    Получает список ресторанов для доставки в точку
+    
+    Args:
+        lat: широта
+        lon: долгота
+        polygons_file: путь к файлу с полигонами
+        
+    Returns:
+        Список ресторанов с зонами доставки
+    """
+    checker = RTEZoneChecker(polygons_file)
+    return checker.get_restaurants_for_point(lat, lon)
 
 
 def main():
-    """Основная функция для демонстрации работы"""
+    """Демонстрация работы с RTE Zones"""
+    print("🗺️  RTE Zones - Проверка геозон доставки")
+    print("=" * 50)
     
-    # Инициализируем checker
-    checker = GeoZoneChecker('polygons.xlsx')
-    
-    # Пример проверки точки (замените на ваши координаты)
-    # Например, координаты центра Москвы
-    test_lat = 55.7558
-    test_lon = 37.6176
-    
-    checker.check_point_example(test_lat, test_lon)
-    
-    # Добавляем информацию о городах (раскомментируйте если нужно)
-    # ВНИМАНИЕ: это может занять много времени для большого количества геозон
-    # checker.add_city_column('polygons_with_cities.xlsx', batch_size=5)
-    
-    print("\nДля добавления городов раскомментируйте соответствующую строку в main()")
-    print("Учтите, что это может занять много времени для большого количества геозон")
+    try:
+        # Инициализируем checker
+        checker = RTEZoneChecker('polygons.xlsx')
+        
+        # Показываем статистику
+        checker.print_stats()
+        
+        # Тестовые координаты
+        test_points = [
+            (55.7558, 37.6176, "Центр Москвы"),
+            (59.9311, 30.3609, "Центр СПб"),
+            (56.8431, 60.6454, "Центр Екатеринбурга"),
+        ]
+        
+        print("\n=== Проверка тестовых точек ===")
+        
+        for lat, lon, description in test_points:
+            print(f"\n📍 {description} ({lat}, {lon}):")
+            
+            # Простая проверка
+            in_zone = checker.is_point_in_any_zone(lat, lon)
+            print(f"  В зоне доставки: {'✅ Да' if in_zone else '❌ Нет'}")
+            
+            if in_zone:
+                # Получаем рестораны
+                restaurants = checker.get_restaurants_for_point(lat, lon)
+                print(f"  Доступно ресторанов: {len(restaurants)}")
+                
+                for i, restaurant in enumerate(restaurants[:3], 1):  # Показываем первые 3
+                    print(f"    {i}. {restaurant['partner']} (ID: {restaurant['restaurant_id']})")
+                    print(f"       Зон доставки: {len(restaurant['zones'])}")
+                
+                if len(restaurants) > 3:
+                    print(f"    ... и еще {len(restaurants) - 3} ресторанов")
+        
+        print("\n=== Примеры использования функций ===")
+        
+        # Пример простой проверки
+        lat, lon = 55.7558, 37.6176
+        result = check_point_simple(lat, lon)
+        print(f"check_point_simple({lat}, {lon}) = {result}")
+        
+        # Пример получения ресторанов
+        restaurants = get_delivery_restaurants(lat, lon)
+        print(f"get_delivery_restaurants({lat}, {lon}) вернул {len(restaurants)} ресторанов")
+        
+    except FileNotFoundError:
+        print("❌ Файл polygons.xlsx не найден!")
+        print("Убедитесь, что файл находится в той же папке что и скрипт")
+    except Exception as e:
+        print(f"❌ Произошла ошибка: {e}")
 
 
 if __name__ == "__main__":
